@@ -1,0 +1,34 @@
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical">
+
+    <!-- Espacio para el dibujo -->
+    <ec.edu.ups.momentos.DrawView
+        android:id="@+id/drawView"
+        android:layout_width="match_parent"
+        android:layout_height="400dp"
+        android:background="#FFFFFF" />
+
+    <TextView
+        android:id="@+id/textView"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Dibuja una figura"
+        android:textSize="18sp"
+        android:textAlignment="center"
+        android:padding="10dp" />
+
+    <Button
+        android:id="@+id/btnClasificar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Clasificar Figura" />
+
+    <Button
+        android:id="@+id/btnLimpiar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Limpiar" />
+
+</LinearLayout>
