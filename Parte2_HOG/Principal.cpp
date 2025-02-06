@@ -1,152 +1,194 @@
 #include <opencv2/opencv.hpp>
 #include <opencv2/ml.hpp>
-#include <opencv2/objdetect.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/highgui.hpp>
 #include <iostream>
 #include <vector>
-#include <string>
-#include <iomanip> // Para formatear la matriz de confusión
+#include <filesystem>
+#include <fstream>
+#include <random>
 
 using namespace cv;
 using namespace std;
+using namespace cv::ml;
+namespace fs = std::filesystem;
 
-// Función para calcular el HOG de una imagen
-vector<float> obtenerHOG(const Mat& imagen) {
-    cv::HOGDescriptor hog;
+// Función para calcular el descriptor HOG con normalización
+void computeHOG(Mat img, vector<float> &descriptors) {
+    HOGDescriptor hog(
+        Size(128, 128), 
+        Size(16, 16),    
+        Size(4, 4),     
+        Size(8, 8),     
+        18             
+    );
 
-    // Establecer los parámetros del HOGDescriptor
-    hog.winSize = Size(64, 128);
-    hog.blockSize = Size(16, 16);
-    hog.blockStride = Size(8, 8);
-    hog.cellSize = Size(8, 8);
-    hog.nbins = 9;
+    resize(img, img, Size(128, 128));
+    GaussianBlur(img, img, Size(3, 3), 0);
+    adaptiveThreshold(img, img, 255, ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY, 11, 2);
+    equalizeHist(img, img);
 
-    vector<float> descriptor;
-    hog.compute(imagen, descriptor);
-    return descriptor;
+    vector<Point> locations;
+    hog.compute(img, descriptors, Size(8, 8), Size(0, 0), locations);
+
+    // Normalizar las características HOG
+    normalize(descriptors, descriptors, 0, 1, NORM_MINMAX);
 }
 
-// Función para leer las imágenes de una carpeta
-vector<Mat> leerImagenes(const string& ruta) {
-    vector<Mat> imagenes;
-    vector<string> nombres_imagenes;
-    glob(ruta, nombres_imagenes);
+// Función para aumentar el dataset con más rotaciones y escalados
+void augmentImage(const Mat &img, vector<Mat> &augmentedImages, int classLabel) {
+    augmentedImages.push_back(img.clone());
 
-    for (const auto& nombre_imagen : nombres_imagenes) {
-        Mat imagen = imread(nombre_imagen);
-        if (!imagen.empty()) {
-            imagenes.push_back(imagen);
+    // Rotaciones (-20° a 20°)
+    for (int angle = -20; angle <= 20; angle += 5) {
+        Mat rotated;
+        Point2f center(img.cols / 2.0, img.rows / 2.0);
+        Mat rotationMatrix = getRotationMatrix2D(center, angle, 1.0);
+        warpAffine(img, rotated, rotationMatrix, img.size());
+        augmentedImages.push_back(rotated);
+    }
+
+    // Escalado (80%-120%)
+    for (double scale = 0.8; scale <= 1.2; scale += 0.2) {
+        Mat scaled;
+        resize(img, scaled, Size(), scale, scale);
+        augmentedImages.push_back(scaled);
+    }
+
+    // Reflejo horizontal
+    Mat flipped;
+    flip(img, flipped, 1);
+    augmentedImages.push_back(flipped);
+}
+
+// Función para cargar imágenes y extraer características HOG
+void loadDataset(const string &path, vector<Mat> &images, vector<int> &labels, int classLabel, const string &outputPath) {
+    for (const auto &entry : fs::directory_iterator(path)) {
+        Mat img = imread(entry.path().string(), IMREAD_GRAYSCALE);
+        if (!img.empty()) {
+            vector<Mat> augmentedImages;
+            augmentImage(img, augmentedImages, classLabel);
+
+            int imgCounter = 0;
+            for (const auto &augImg : augmentedImages) {
+                string savePath = outputPath + "/" + to_string(classLabel) + "_" + to_string(imgCounter++) + ".png";
+                imwrite(savePath, augImg);
+                images.push_back(augImg);
+                labels.push_back(classLabel);
+            }
+        }
+    }
+}
+
+// Función para entrenar el clasificador SVM
+void trainSVM(vector<Mat> &images, vector<int> &labels) {
+    vector<vector<float>> trainingData;
+    for (auto &img : images) {
+        vector<float> descriptors;
+        computeHOG(img, descriptors);
+        trainingData.push_back(descriptors);
+    }
+
+    Mat trainData(trainingData.size(), trainingData[0].size(), CV_32F);
+    for (size_t i = 0; i < trainingData.size(); i++) {
+        for (size_t j = 0; j < trainingData[i].size(); j++) {
+            trainData.at<float>(i, j) = trainingData[i][j];
         }
     }
 
-    return imagenes;
+    Mat trainLabels(labels.size(), 1, CV_32S, labels.data());
+
+    Ptr<SVM> svm = SVM::create();
+    svm->setType(SVM::C_SVC);
+    svm->setKernel(SVM::LINEAR);  // Cambiar a un kernel no lineal
+    svm->setC(10.0);  // Ajusta C según sea necesario
+    svm->setGamma(0.5);  // Ajusta el parámetro gamma para el kernel RBF
+    svm->setTermCriteria(TermCriteria(TermCriteria::MAX_ITER, 5000, 1e-7));
+
+    cout << "Entrenando el modelo SVM con parámetros optimizados y HOG..." << endl;
+    svm->train(trainData, ROW_SAMPLE, trainLabels);
+    cout << "Entrenamiento completado." << endl;
+
+    svm->save("logos_svm.xml");
+    cout << "Modelo guardado en 'logos_svm.xml'." << endl;
 }
 
-// Función para imprimir la matriz de confusión
-void imprimirMatrizConfusion(const Mat& matriz_confusion, int num_clases) {
-    for (int i = 0; i < num_clases; ++i) {
-        for (int j = 0; j < num_clases; ++j) {
-            cout << setw(5) << matriz_confusion.at<int>(i, j) << " ";
-        }
-        cout << endl;
+// Función para predicción con el modelo SVM
+string predictSVM(const Ptr<SVM>& svm, const vector<float>& descriptor) {
+    Mat testSample(1, descriptor.size(), CV_32F);
+    for (size_t i = 0; i < descriptor.size(); i++) {
+        testSample.at<float>(0, i) = descriptor[i];
     }
+
+    // Obtener la respuesta del SVM (predicción)
+    Mat response;
+    svm->predict(testSample, response);
+
+    // Obtener la distancia al hiperplano
+    Mat dist;
+    svm->predict(testSample, dist, StatModel::RAW_OUTPUT);
+
+    // Calcula la confianza basándote en la distancia al hiperplano
+    float confidence = dist.at<float>(0, 0);  // La distancia al hiperplano de decisión
+    cout << "Confianza: " << confidence << endl;
+
+    // Si la confianza es baja, consideramos que la clase es desconocida
+    if (fabs(confidence) < 0.5) {  // Ajusta el umbral según sea necesario
+        return "desconocido";
+    }
+
+    // De lo contrario, retornamos la clase predicha
+    return response.at<float>(0, 0) == -1 ? "desconocido" : to_string(static_cast<int>(response.at<float>(0, 0)));
 }
 
+// Función principal
 int main() {
-    vector<string> carpetas = {"images/android", "images/batman", "images/chrome", "images/facebook", "images/instagram"};
-    vector<Mat> imagenes_entrenamiento;
-    vector<int> etiquetas_entrenamiento;
+    vector<Mat> images;
+    vector<int> labels;
+    string outputPath = "dataset_augmented";
 
-    for (int i = 0; i < carpetas.size(); ++i) {
-        string ruta = "./" + carpetas[i] + "/*";
-        vector<Mat> imagenes = leerImagenes(ruta);
-        for (const auto& imagen : imagenes) {
-            Mat imagen_redimensionada;
+    fs::create_directories(outputPath);
 
-            // Preprocesamiento de la imagen
-            resize(imagen, imagen_redimensionada, Size(64, 128));
-            cvtColor(imagen_redimensionada, imagen_redimensionada, COLOR_BGR2GRAY); // Convertir a escala de grises
-            equalizeHist(imagen_redimensionada, imagen_redimensionada); // Ecualización del histograma
-            GaussianBlur(imagen_redimensionada, imagen_redimensionada, Size(3, 3), 0); // Suavizado para reducir ruido
+    // Cargar datasets de diferentes clases
+    loadDataset("images/batman", images, labels, 1, outputPath);
+    loadDataset("images/chrome", images, labels, 2, outputPath);
+    loadDataset("images/ebay", images, labels, 3, outputPath);
+    loadDataset("images/facebook", images, labels, 4, outputPath);
+    loadDataset("images/instagram", images, labels, 5, outputPath);
 
-            vector<float> descriptor = obtenerHOG(imagen_redimensionada);
-            imagenes_entrenamiento.push_back(imagen_redimensionada);
-            etiquetas_entrenamiento.push_back(i);
+    cout << "Total de imágenes tras aumentación: " << images.size() << endl;
+
+    // Dividir en conjunto de entrenamiento y prueba (80% entrenamiento, 20% prueba)
+    int trainSize = static_cast<int>(images.size() * 0.8);  // 80% para entrenamiento
+    vector<Mat> trainImages(images.begin(), images.begin() + trainSize);
+    vector<int> trainLabels(labels.begin(), labels.begin() + trainSize);
+
+    vector<Mat> testImages(images.begin() + trainSize, images.end());
+    vector<int> testLabels(labels.begin() + trainSize, labels.end());
+
+    // Entrenamiento del modelo SVM con el conjunto de entrenamiento
+    trainSVM(trainImages, trainLabels);
+
+    // Cargar el modelo SVM guardado
+    Ptr<SVM> svm = SVM::load("logos_svm.xml");
+
+    // Predicción en el conjunto de prueba
+    int correct = 0;
+    for (size_t i = 0; i < testImages.size(); i++) {
+        vector<float> descriptors;
+        computeHOG(testImages[i], descriptors);
+
+        // Predicción
+        string predictedLabel = predictSVM(svm, descriptors);
+
+        if (predictedLabel == to_string(testLabels[i])) {
+            correct++;
         }
     }
 
-    Ptr<ml::SVM> svm = ml::SVM::create();
-    svm->setKernel(ml::SVM::RBF);  // Usar un kernel RBF para un mejor ajuste
-    svm->setType(ml::SVM::C_SVC);
-    svm->setC(1);  // Ajustar este parámetro para mejorar la generalización
-
-    Mat datos_entrenamiento(imagenes_entrenamiento.size(), 3780, CV_32F);
-    for (size_t i = 0; i < imagenes_entrenamiento.size(); ++i) {
-        vector<float> descriptor = obtenerHOG(imagenes_entrenamiento[i]);
-        for (size_t j = 0; j < descriptor.size(); ++j) {
-            datos_entrenamiento.at<float>(i, j) = descriptor[j];
-        }
-    }
-
-    Ptr<ml::TrainData> trainData = ml::TrainData::create(datos_entrenamiento, ml::SampleTypes::ROW_SAMPLE, etiquetas_entrenamiento);
-    svm->train(trainData);
-    svm->save("svm_logo.xml");
-
-    cout << "Clasificador entrenado y guardado como 'svm_logo.xml'." << endl;
-
-    // Crear una matriz de confusión
-    int num_clases = carpetas.size();
-    Mat matriz_confusion = Mat::zeros(num_clases, num_clases, CV_32S);  // Matriz de confusión inicializada a 0
-
-    // Clasificar las imágenes de entrenamiento para crear la matriz de confusión
-    for (size_t i = 0; i < imagenes_entrenamiento.size(); ++i) {
-        vector<float> descriptor = obtenerHOG(imagenes_entrenamiento[i]);
-        Mat descriptor_mat(1, descriptor.size(), CV_32F);
-        for (size_t j = 0; j < descriptor.size(); ++j) {
-            descriptor_mat.at<float>(0, j) = descriptor[j];
-        }
-
-        // Predecir la etiqueta
-        int etiqueta_predicha = svm->predict(descriptor_mat);
-        int etiqueta_real = etiquetas_entrenamiento[i];
-
-        // Actualizar la matriz de confusión
-        matriz_confusion.at<int>(etiqueta_real, etiqueta_predicha)++;
-    }
-
-    // Imprimir la matriz de confusión
-    cout << "Matriz de Confusión:" << endl;
-    imprimirMatrizConfusion(matriz_confusion, num_clases);
-
-    // Cargar una nueva imagen para predecir
-    string ruta_imagen_prueba = "images/chrome/C_chrome_1.png"; // Ruta de la imagen de prueba
-    Mat imagen_prueba = imread(ruta_imagen_prueba);
-
-    if (!imagen_prueba.empty()) {
-        Mat imagen_redimensionada;
-
-        // Preprocesar la imagen de prueba
-        resize(imagen_prueba, imagen_redimensionada, Size(64, 128));
-        cvtColor(imagen_redimensionada, imagen_redimensionada, COLOR_BGR2GRAY); // Convertir a escala de grises
-        equalizeHist(imagen_redimensionada, imagen_redimensionada); // Ecualización del histograma
-        GaussianBlur(imagen_redimensionada, imagen_redimensionada, Size(3, 3), 0); // Suavizado para reducir ruido
-
-        vector<float> descriptor = obtenerHOG(imagen_redimensionada);
-        Mat descriptor_mat(1, descriptor.size(), CV_32F);
-        for (size_t i = 0; i < descriptor.size(); ++i) {
-            descriptor_mat.at<float>(0, i) = descriptor[i];
-        }
-
-        // Obtener la predicción
-        int etiqueta_predicha = svm->predict(descriptor_mat); // Predicción directa
-        cout << "El logo predicho es: " << carpetas[etiqueta_predicha] << endl;
-
-        // Mostrar la imagen de prueba con el logo predicho
-        imshow("Imagen Predicha", imagen_prueba);
-        waitKey(0); // Esperar hasta que el usuario presione una tecla para cerrar la ventana
-
-    } else {
-        cout << "No se pudo cargar la imagen de prueba." << endl;
-    }
+    // Mostrar el porcentaje de aciertos
+    float accuracy = static_cast<float>(correct) / testImages.size() * 100.0;
+    cout << "Precisión del modelo en el conjunto de prueba: " << accuracy << "%" << endl;
 
     return 0;
 }

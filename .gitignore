@@ -420,3 +420,7 @@ fabric.properties
 !/gradle/wrapper/gradle-wrapper.jar
 
 # End of https://www.toptal.com/developers/gitignore/api/windows,linux,python,venv,android,androidstudio,c++
+
+logos_svm.xml
+svm_model.xml
+dataset_augmented
